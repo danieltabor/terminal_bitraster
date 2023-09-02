@@ -83,7 +83,7 @@ static void usage(char* cmd) {
 	fprintf(stderr,"  -o : Initial Byte offset into file\n");
 	fprintf(stderr,"  -d : Delay, in millisecons, or any automatic updates\n");
 	fprintf(stderr,"\n");
-	fprintf(stderr,"If path is not provided, data is streamed from stdin, -w and -o are ignored\n");
+	fprintf(stderr,"If path is not provided, data is streamed from stdin; -o is ignored\n");
 	exit(0);
 }
 
