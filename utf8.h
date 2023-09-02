@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Daniel Tabor
+ * Copyright (c) 2022, Daniel Tabor
  * All rights reserved.
  * 
  * Redistribution and use in source and binary forms, with or without
@@ -142,9 +142,6 @@ uint32_t trs80[192] = {
 // encodes any 32bit value.
 static char utf8_encoded_character[8];
 char* utf8_encode(char* dst, uint32_t character) {
-	uint8_t shift;
-	uint8_t i;
-	
 	if( dst == 0 ) {
 		dst = utf8_encoded_character;
 	}

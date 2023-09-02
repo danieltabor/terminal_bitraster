@@ -47,6 +47,9 @@ static size_t buffer_width = 0;
 static int last_term_w = 0;
 static int last_term_h = 0;
 static int col_offset = 0;
+static int delay_ms = 250;
+static int life = 0;
+static uint8_t* life_buffer = 0;
 
 #define UTF8_IMPLEMENTATION
 #include "utf8.h"
@@ -73,15 +76,19 @@ static void usage(char* cmd) {
 		}
 	}
 	fprintf(stderr,"Usage:\n");
-	fprintf(stderr,"%s [-h] [-r] [-wWidth] [-oOffset] path\n",cmd_filename);
+	fprintf(stderr,"%s [-h] [-r] [-wWidth] [-oOffset] [-dDelayMS] [path]\n",cmd_filename);
 	fprintf(stderr,"\n");
+	fprintf(stderr,"  -w : Bit width of buffer (controls horizontal scroll)\n");
+	fprintf(stderr,"       Width must be a multple of 8 bits.\n");
+	fprintf(stderr,"  -o : Initial Byte offset into file\n");
+	fprintf(stderr,"  -d : Delay, in millisecons, or any automatic updates\n");
+	fprintf(stderr,"\n");
+	fprintf(stderr,"If path is not provided, data is streamed from stdin, -w and -o are ignored\n");
 	exit(0);
 }
 
-void term_setup() {
+static void term_setup() {
 	int flags;
-	struct termios tios;
-
 	TTY tty;
 	
 	//Use fcntl to make stdin NON-BLOCKING
@@ -108,7 +115,7 @@ void term_setup() {
 	}
 }
 
-void term_reset() {
+static void term_reset() {
 	int flags;
 	TTY tty;
 	
@@ -140,16 +147,62 @@ void term_reset() {
 	fflush(stdout);
 }
 
-void term_size(int* width, int* height) {
+static void term_size(int* width, int* height) {
 	struct winsize ws;
 	
 	//Use ioctl/TIOCGWINSZ to get terminal size
 	errno = 0;
-	if( ioctl(STDIN_FILENO,TIOCGWINSZ,&ws) < 0 ) {
+	if( ioctl(STDOUT_FILENO,TIOCGWINSZ,&ws) < 0 ) {
 		ERROR("Error geting terminal size: %s\n",strerror(errno));
 	}
 	*width = ws.ws_col;
 	*height = ws.ws_row;
+}
+
+static inline int getbit(uint8_t* buf, int x, int y) {
+	size_t bit_index; 
+	size_t byte_index;
+	uint8_t byte_shift;
+	
+	if( x < 0 || x >= buffer_width || y < 0 ) {
+		return 0;
+	}
+	
+	bit_index = y*buffer_width + x;
+	byte_index = bit_index/8;
+	if( byte_index >= buffer_size ) {
+		return 0;
+	}
+	if( reverse_byte ) {
+		byte_shift = bit_index%8;
+	}
+	else {
+		byte_shift = 7-(bit_index%8);
+	}
+	return (buf[byte_index]>>byte_shift) & 1;
+}
+
+static inline void setbit(uint8_t* buf, int x, int y) {
+	size_t bit_index; 
+	size_t byte_index;
+	uint8_t byte_shift;
+	
+	if( x < 0 || x > buffer_width || y < 0 ) {
+		return;
+	}
+	
+	bit_index = y*buffer_width+x;
+	byte_index = bit_index/8;
+	if( byte_index > buffer_size ) {
+		return;
+	}
+	if( reverse_byte ) {
+		byte_shift = bit_index%8;
+	}
+	else {
+		byte_shift = 7-(bit_index%8);
+	}
+	buf[byte_index] |= (1<<byte_shift);
 }
 
 static uint32_t sextant_chars[64] = {
@@ -166,22 +219,28 @@ static uint32_t sextant_chars[64] = {
 static void update() {
 	int term_w, term_h;
 	int char_x, char_y;
-	int disp_h, disp_w;
+	int disp_w;
 	int off_x;
 	size_t new_buffer_size;
-	size_t bit_index;
-	size_t byte_index;
-	uint8_t byte_shift;
 	uint8_t* tmp;
 	uint8_t index;
 	
-	term_size(&term_w,&term_h);;
+	term_size(&term_w,&term_h);
 	if(   term_h != last_term_h || 
 	      term_w != last_term_w || 
 	      buffer_offset != offset ) {
+		//If left unset, set buffer_width the maximum displayable
+		//number of bits
 		if( !buffer_width ) {
 			buffer_width = term_w*2;
 		}
+		if( buffer_width % 8 ) {
+			buffer_width = buffer_width - (buffer_width % 8);
+		}
+		
+		//Determine (based on current terminal size)
+		//how many Bytes of data can be displayed and resize
+		//buffer to accept them
 		new_buffer_size = (term_h*3) * buffer_width;
 		if( new_buffer_size % 8 ) {
 			new_buffer_size = new_buffer_size/8+1;
@@ -195,12 +254,15 @@ static void update() {
 		if( new_buffer_size != buffer_size ) {
 			errno = 0;
 			tmp = realloc(buffer,new_buffer_size);
-			if( ! tmp ) {
+			if( !tmp ) {
+				free(buffer);
 				ERROR("Memory allocation error: %s\n",strerror(errno));
 			}
 			buffer = tmp;
 			buffer_size = new_buffer_size;
 		}
+		
+		//Seek and read the file
 		if( offset + buffer_size > fd_size ) {
 			offset = fd_size - buffer_size;
 		}
@@ -215,6 +277,7 @@ static void update() {
 		if( read(fd,buffer,buffer_size) != (ssize_t)buffer_size ) {
 			ERROR("File read error: %s\n",strerror(errno));
 		}
+
 		last_term_h = term_h;
 		last_term_w = term_w;
 		buffer_offset = offset;
@@ -238,99 +301,67 @@ static void update() {
 			printf("\n");
 		}
 		for( char_x=0; char_x<disp_w; char_x++ ) {
+			off_x = col_offset + char_x*2;
 			index = 0;
-			off_x = char_x*2 + col_offset;
-			index = (index << 1);
-			bit_index = (char_y*3)*buffer_width + off_x;
-			byte_index = bit_index/8;
-			if( byte_index < buffer_size ) {
-				if( reverse_byte ) {
-					byte_shift = bit_index%8;
-				}
-				else {
-					byte_shift = 7-(bit_index%8);
-				}
-				index |= ((buffer[byte_index]>>byte_shift)&1);
-			}
-			index = (index << 1);
-			if( off_x+1 < buffer_width ) {
-				bit_index = (char_y*3)*buffer_width + off_x+1;
-				byte_index = bit_index/8;
-				if( byte_index < buffer_size ) {
-					if( reverse_byte ) {
-						byte_shift = bit_index%8;
-					}
-					else {
-						byte_shift = 7-(bit_index%8);
-					}
-					index |= ((buffer[byte_index]>>byte_shift)&1);
-				}
-			}
-			index = (index << 1);
-			if( off_x < buffer_width ) {
-				bit_index = ((char_y*3)+1)*buffer_width + off_x;
-				byte_index = bit_index/8;
-				if( byte_index < buffer_size ) {
-					if( reverse_byte ) {
-						byte_shift = bit_index%8;
-					}
-					else {
-						byte_shift = 7-(bit_index%8);
-					}
-					index |= ((buffer[byte_index]>>byte_shift)&1);
-				}
-			}
-			index = (index << 1);
-			if( off_x+1 < buffer_width ) {
-				bit_index = ((char_y*3)+1)*buffer_width + off_x+1;
-				byte_index = bit_index/8;
-				if( byte_index < buffer_size ) {
-					if( reverse_byte ) {
-						byte_shift = bit_index%8;
-					}
-					else {
-						byte_shift = 7-(bit_index%8);
-					}
-					index |= ((buffer[byte_index]>>byte_shift)&1);
-				}
-			}
-			index = (index << 1);
-			if( off_x < buffer_width ) {
-				bit_index = ((char_y*3)+2)*buffer_width + off_x;
-				byte_index = bit_index/8;
-				if( byte_index < buffer_size ) {
-					if( reverse_byte ) {
-						byte_shift = bit_index%8;
-					}
-					else {
-						byte_shift = 7-(bit_index%8);
-					}
-					index |= ((buffer[byte_index]>>byte_shift)&1);
-				}
-			}
-			index = (index << 1);
-			if( off_x+1 < buffer_width ) {
-				bit_index = ((char_y*3)+2)*buffer_width + off_x+1;
-				byte_index = bit_index/8;
-				if( byte_index < buffer_size ) {
-					if( reverse_byte ) {
-						byte_shift = bit_index%8;
-					}
-					else {
-						byte_shift = 7-(bit_index%8);
-					}
-					index |= ((buffer[byte_index]>>byte_shift)&1);
-				}
-			}
+			index = (index<<1) | getbit(buffer,off_x  , char_y*3   );
+			index = (index<<1) | getbit(buffer,off_x+1, char_y*3   );
+			index = (index<<1) | getbit(buffer,off_x  ,(char_y*3)+1);
+			index = (index<<1) | getbit(buffer,off_x+1,(char_y*3)+1);
+			index = (index<<1) | getbit(buffer,off_x  ,(char_y*3)+2);
+			index = (index<<1) | getbit(buffer,off_x+1,(char_y*3)+2);
 			printf("%s",utf8_encode(0,sextant_chars[index]));
 		}
 	}
 	fflush(stdout);
 }
 
+static void step_life() {
+	int count;
+	int x,y;
+	int h = (buffer_size*8)/buffer_width;
+	if( !life_buffer ) {
+		life_buffer = malloc(buffer_size);
+	}
+	memset(life_buffer,0,buffer_size);
+	for( y=0; y<h; y++ ) {
+		for( x=0; x<buffer_width; x++ ) {
+			count = 0;
+			count += getbit(buffer,x-1,y-1);
+			count += getbit(buffer,x  ,y-1);
+			count += getbit(buffer,x+1,y-1);
+			count += getbit(buffer,x-1,y  );
+			count += getbit(buffer,x+1,y  );
+			count += getbit(buffer,x-1,y+1);
+			count += getbit(buffer,x  ,y+1);
+			count += getbit(buffer,x+1,y+1);
+			if( getbit(buffer,x,y) ) {
+				if( count == 2 || count == 3 ) {
+					setbit(life_buffer,x,y);
+				}
+			}
+			else {
+				if( count == 3 ) {
+					setbit(life_buffer,x,y);
+				}
+			}
+		}
+	}
+	memcpy(buffer,life_buffer,buffer_size);
+}
+
+void run_sigint_handler(int signalId) {
+	(void)signalId;
+	term_reset();
+	exit(0);
+}
+
 static void run() {
 	uint8_t input[8];
 	ssize_t inputlen;
+	struct sigaction action;
+	
+	action.sa_handler = run_sigint_handler;
+	sigaction(SIGINT, &action, 0);
 	
 	term_setup();
 	update();
@@ -341,6 +372,14 @@ static void run() {
 		if( inputlen < 0 ) {
 			if( errno != EAGAIN ) {
 				break;
+			}
+			if( life ) {
+				step_life();
+				update();
+				usleep(delay_ms*1000);
+			}
+			else {
+				usleep(100000);
 			}
 			continue;
 		}
@@ -368,6 +407,10 @@ static void run() {
 			}
 			else if( input[0] == 'l' || input[0] == 'L' ) {
 				col_offset++;
+			}
+			else if( input[0] == 'r' || input[0] == 'R' ) {
+				life = 1;
+				continue;
 			}
 		}
 		else if( inputlen == 3 ) {
@@ -402,21 +445,74 @@ static void run() {
 				}
 			}
 		}
+		if( life ) {
+			life = 0;
+			free(life_buffer);
+			life_buffer = 0;
+			buffer_offset = -1;
+		}
 		update();
 	}
 	
 	term_reset();
 }
 
-void sigint_handler(int signalId) {
+void stream_sigint_handler(int signalId) {
 	(void)signalId;
-	term_reset();
 	exit(0);
+}
+
+static void stream() {
+	int term_w, term_h;
+	int char_x, disp_w;
+	uint8_t* tmp;
+	uint8_t index;
+	struct sigaction action;
+	
+	action.sa_handler = stream_sigint_handler;
+	sigaction(SIGINT, &action, 0);
+	
+	for(;;) {
+		term_size(&term_w,&term_h);
+		if( !buffer_width ) {
+			buffer_width = term_w*2;
+		}
+		if( buffer_width % 8 ) {
+			buffer_width = buffer_width - (buffer_width % 8);
+		}
+		
+		buffer_size = buffer_width/8*3;
+		tmp = realloc(buffer,buffer_size);
+		if( !tmp ) {
+			free(buffer);
+			fprintf(stderr,"Memory allocation error: %s\n",strerror(errno));
+			exit(-1);
+		}
+		buffer = tmp;
+	
+		if( read(STDIN_FILENO,buffer,buffer_size) != (ssize_t)buffer_size ) {
+			return;
+		}
+		disp_w = buffer_width/2;
+		for( char_x=0; char_x<disp_w; char_x++ ) {
+			index = 0;
+			index = (index<<1) | getbit(buffer,2*char_x  ,0);
+			index = (index<<1) | getbit(buffer,2*char_x+1,0);
+			index = (index<<1) | getbit(buffer,2*char_x  ,1);
+			index = (index<<1) | getbit(buffer,2*char_x+1,1);
+			index = (index<<1) | getbit(buffer,2*char_x  ,2);
+			index = (index<<1) | getbit(buffer,2*char_x+1,2);
+			printf("%s",utf8_encode(0,sextant_chars[index]));
+		}
+		printf("\n");
+		fflush(stdout);
+		
+		usleep(delay_ms*1000);
+	}
 }
 
 int main(int argc, char** argv) {
 	int i;
-	struct sigaction action;
 	
 	i = 1;
 	while( i < argc ) {
@@ -433,12 +529,28 @@ int main(int argc, char** argv) {
 				fprintf(stderr,"Width error: %s\n\n",strerror(errno));
 				usage(argv[0]);
 			}
+			if( buffer_width % 8 ) {
+				fprintf(stderr,"Width is not even multiple of 8\n\n");
+				usage(argv[0]);
+			}
 		}
 		else if( !strncmp(argv[i],"-o",2) ) {
 			errno = 0;
 			offset = strtoul(argv[i]+2,0,0);
 			if( errno ) {
 				fprintf(stderr,"Offset error: %s\n\n",strerror(errno));
+				usage(argv[0]);
+			}
+			else if( offset < 0 ) {
+				fprintf(stderr,"Offset negative\n\n");
+				usage(argv[0]);
+			}
+		}
+		else if( !strncmp(argv[i],"-d",2) ) {
+			errno = 0;
+			delay_ms = strtoul(argv[i]+2,0,0);
+			if( errno ) {
+				fprintf(stderr,"Delay error: %s\n\n",strerror(errno));
 				usage(argv[0]);
 			}
 		}
@@ -462,11 +574,11 @@ int main(int argc, char** argv) {
 	}
 	
 	if( fd < 0 ) {
-		usage(argv[0]);
+		stream();
+	}
+	else {
+		run();
 	}
 	
-	action.sa_handler = sigint_handler;
-	sigaction(SIGINT, &action, 0);
-	run();
 	return 0;
 }
