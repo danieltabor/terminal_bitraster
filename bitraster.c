@@ -467,6 +467,8 @@ static void stream() {
 	int char_x, disp_w;
 	uint8_t* tmp;
 	uint8_t index;
+	ssize_t readlen;
+	size_t buffer_offset;
 	struct sigaction action;
 	
 	action.sa_handler = stream_sigint_handler;
@@ -490,8 +492,13 @@ static void stream() {
 		}
 		buffer = tmp;
 	
-		if( read(STDIN_FILENO,buffer,buffer_size) != (ssize_t)buffer_size ) {
-			return;
+		buffer_offset = 0;
+		while( buffer_offset < buffer_size ) {
+			readlen = read(STDIN_FILENO,buffer+buffer_offset,buffer_size-buffer_offset);
+			if( readlen <= 0 ) {
+				return;
+			}
+			buffer_offset = buffer_offset + readlen;
 		}
 		disp_w = buffer_width/2;
 		for( char_x=0; char_x<disp_w; char_x++ ) {
